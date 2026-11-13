@@ -127,6 +127,28 @@ class Link2CProProfileTests(unittest.TestCase):
             self.assertLessEqual(abs(back[0] - pan), 1)
             self.assertLessEqual(abs(back[1] - tilt), 1)
 
+    def test_crop_position_survives_reconnect(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        from link_studio.camera import CameraDevice
+
+        with (
+            tempfile.TemporaryDirectory() as state,
+            mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}),
+        ):
+            camera, _writes, _state = _fake_2c_pro()
+            camera.device = CameraDevice("/dev/null", "x", 0x2E1A, 0x4C05, "b", "uvcvideo")
+            camera.set_control("pan", 50)
+            camera.set_control("tilt", 20)
+            camera.save_digital_view()
+            again = object.__new__(Camera)
+            again.device = camera.device
+            again.profile = LINK2C_PRO_PROFILE
+            again._load_digital_view()
+            self.assertEqual((again._digital_pan, again._digital_tilt), (50, 20))
+
 
 if __name__ == "__main__":
     unittest.main()

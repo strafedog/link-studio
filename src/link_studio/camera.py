@@ -271,8 +271,6 @@ class Camera:
         self.profile = profile_for(device.product_id)
         if self.profile.digital_ptz:
             self._load_digital_view()
-        self._digital_pan = 0
-        self._digital_tilt = 0
 
     def __enter__(self) -> Self:
         return self
