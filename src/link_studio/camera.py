@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import json
 import os
 import re
 import struct
@@ -151,6 +152,11 @@ def digital_ptz_position(pan: int, tilt: int) -> tuple[int, int]:
     return max(0, min(0xFFFF, x)), max(0, min(0xFFFF, y))
 
 
+def digital_view_state_path(product_id: int) -> Path:
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    return state_home / f"link-studio/digital-view-{product_id:04x}.json"
+
+
 def digital_ptz_angles(x: float, y: float) -> tuple[int, int]:
     """Inverse of digital_ptz_position for a crop centre in 0..1 frame coordinates."""
 
@@ -263,6 +269,8 @@ class Camera:
         self._last_mode_time = 0.0
         self._cancel_operations = threading.Event()
         self.profile = profile_for(device.product_id)
+        if self.profile.digital_ptz:
+            self._load_digital_view()
         self._digital_pan = 0
         self._digital_tilt = 0
 
@@ -318,6 +326,25 @@ class Camera:
             XU_DIGITAL_PTZ_UNIT, XU_DIGITAL_PTZ, struct.pack("<HHHBB", zoom, x, y, 0x14, 0x14)
         )
 
+    def _load_digital_view(self) -> None:
+        # The 2C Pro never reports its crop position, so remember the last one we sent.
+        try:
+            raw = json.loads(digital_view_state_path(self.device.product_id).read_text())
+            self._digital_pan = max(-145, min(145, int(raw["pan"])))
+            self._digital_tilt = max(-90, min(100, int(raw["tilt"])))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def save_digital_view(self) -> None:
+        if not self.profile.digital_ptz:
+            return
+        path = digital_view_state_path(self.device.product_id)
+        with suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"pan": self._digital_pan, "tilt": self._digital_tilt}))
+            temporary.replace(path)
+
     def set_digital_view(self, pan: int, tilt: int, zoom: int | None = None) -> tuple[int, int]:
         """Move (and optionally zoom) the 2C Pro crop window in a single vendor write."""
 
@@ -372,6 +399,7 @@ class Camera:
             self._digital_pan = self._digital_tilt = 0
             self.xu_set(XU_FEATURE_UNIT, XU_PTZ_RESET, bytes(8))
             self.set_control("zoom", 100)
+            self.save_digital_view()
             return
         self.set_control("pan", 0)
         self.set_control("tilt", 0)

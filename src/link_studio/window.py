@@ -34,6 +34,7 @@ from .camera import (
     FEATURE_HDR,
     FEATURE_MIRROR,
     Camera,
+    CameraError,
     digital_ptz_angles,
     digital_ptz_position,
 )
@@ -175,6 +176,10 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         )
         self.camera = camera
         self.state = camera.read_state()
+        if _camera_profile(camera).digital_ptz and int(self.state.get("zoom", 100)) > 100:
+            # Re-send the remembered crop so the camera and the minimap agree.
+            with suppress(OSError, CameraError):
+                camera.set_digital_view(int(self.state["pan"]), int(self.state["tilt"]))
         self.preview = PreviewStream(camera.device.path)
         self.latest_frame: Frame | None = None
         self.recorder: Recorder | None = None
@@ -683,8 +688,10 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         zoom_column.set_valign(Gtk.Align.CENTER)
         zoom_column.add_css_class("card")
         zoom_column.set_margin_start(4)
-        zoom_in = Gtk.Button(icon_name="list-add-symbolic")
-        zoom_out = Gtk.Button(icon_name="list-remove-symbolic")
+        zoom_in = Gtk.Button(label="+")
+        zoom_out = Gtk.Button(label="−")
+        zoom_in.set_tooltip_text("Zoom in")
+        zoom_out.set_tooltip_text("Zoom out")
         for button in (zoom_in, zoom_out):
             button.add_css_class("flat")
             button.add_css_class("circular")
@@ -713,7 +720,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
     # Link Controller streams crop positions roughly every 80-120 ms while dragging and
     # the firmware glides between them, so send the latest position at that rate
     # (never queueing stale ones) rather than waiting for the drag to pause.
-    _DIGITAL_VIEW_INTERVAL_MS = 80
+    _DIGITAL_VIEW_INTERVAL_MS = 40
 
     def _push_digital_view(self, zoom_changed: bool = False) -> None:
         self._digital_view_dirty = True
@@ -728,6 +735,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
 
         def done(_result: object = None) -> None:
             GLib.timeout_add(self._DIGITAL_VIEW_INTERVAL_MS, release)
+            self._debounce("digital_view_save", self.camera.save_digital_view, delay_ms=1000)
 
         def release() -> bool:
             self._digital_view_busy = False
