@@ -13,12 +13,12 @@ from pathlib import Path
 from typing import Any, Self
 
 from .constants import (
-    AUDIO_MODES,
-    FRAMING_MODES,
     INSTA360_VENDOR_ID,
+    LINK2_PROFILE,
     STANDARD_CONTROLS,
     SUPPORTED_PRODUCTS,
-    VIDEO_MODES,
+    ModelProfile,
+    profile_for,
 )
 
 
@@ -67,6 +67,20 @@ class _V4L2Control(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint32), ("value", ctypes.c_int32)]
 
 
+class _V4L2QueryControl(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint32),
+        ("type", ctypes.c_uint32),
+        ("name", ctypes.c_char * 32),
+        ("minimum", ctypes.c_int32),
+        ("maximum", ctypes.c_int32),
+        ("step", ctypes.c_int32),
+        ("default_value", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 2),
+    ]
+
+
 class _UvcXuControlQuery(ctypes.Structure):
     _fields_ = [
         ("unit", ctypes.c_uint8),
@@ -97,6 +111,7 @@ def _ior(ioctl_type: str, number: int, ctype: type[ctypes.Structure]) -> int:
 VIDIOC_QUERYCAP = _ior("V", 0, _V4L2Capability)
 VIDIOC_G_CTRL = _iorw("V", 27, _V4L2Control)
 VIDIOC_S_CTRL = _iorw("V", 28, _V4L2Control)
+VIDIOC_QUERYCTRL = _iorw("V", 36, _V4L2QueryControl)
 UVCIOC_CTRL_QUERY = _iorw("u", 0x21, _UvcXuControlQuery)
 
 V4L2_CAP_VIDEO_CAPTURE = 0x00000001
@@ -117,6 +132,12 @@ XU_FEATURE_MASK = 0x1B
 XU_SHUTTER = 0x1D
 XU_AUTO_EXPOSURE = 0x1E
 XU_PRIVACY = 0x0F
+XU_PTZ_RESET = 0x1A
+# Link 2C Pro digital pan/tilt window: <u16 zoom><u16 x><u16 y><u8 0x14><u8 0x14>,
+# x/y 0..0xFFFF across the sensor, smaller y is up. Values as Link Controller sends.
+XU_DIGITAL_PTZ_UNIT = 10
+XU_DIGITAL_PTZ = 0x13
+DIGITAL_PTZ_CENTER = (0x8000, 0x7D09)
 
 FEATURE_HDR = 2
 FEATURE_MIRROR = 3
@@ -204,6 +225,10 @@ class Camera:
     another camera client owns the video stream.
     """
 
+    profile: ModelProfile = LINK2_PROFILE
+    _digital_pan = 0
+    _digital_tilt = 0
+
     def __init__(self, device: CameraDevice):
         self.device = device
         self._fd = os.open(device.path, os.O_RDWR | os.O_NONBLOCK)
@@ -212,6 +237,9 @@ class Camera:
         self._last_mode = "unknown"
         self._last_mode_time = 0.0
         self._cancel_operations = threading.Event()
+        self.profile = profile_for(device.product_id)
+        self._digital_pan = 0
+        self._digital_tilt = 0
 
     def __enter__(self) -> Self:
         return self
@@ -246,7 +274,32 @@ class Camera:
             error_number = ctypes.get_errno() or errno.EIO
             raise OSError(error_number, os.strerror(error_number), self.device.path)
 
+    def control_maximum(self, key: str) -> int:
+        """Maximum the firmware advertises for a standard control (may be below the spec)."""
+
+        spec = STANDARD_CONTROLS[key]
+        query = _V4L2QueryControl(id=spec.control_id)
+        try:
+            with self._lock:
+                self._ioctl(VIDIOC_QUERYCTRL, query)
+        except OSError:
+            return spec.maximum
+        return min(spec.maximum, query.maximum)
+
+    def _digital_ptz_write(self) -> None:
+        zoom = self.get_control("zoom")
+        pan, tilt = self._digital_pan, self._digital_tilt
+        cx, cy = DIGITAL_PTZ_CENTER
+        x = cx + round(pan / 145 * 0x7FFF)
+        y = cy - round(tilt / (100 if tilt >= 0 else 90) * (cy if tilt >= 0 else 0xFFFF - cy))
+        x, y = max(0, min(0xFFFF, x)), max(0, min(0xFFFF, y))
+        self.xu_set(
+            XU_DIGITAL_PTZ_UNIT, XU_DIGITAL_PTZ, struct.pack("<HHHBB", zoom, x, y, 0x14, 0x14)
+        )
+
     def get_control(self, key: str) -> int:
+        if self.profile.digital_ptz and key in {"pan", "tilt"}:
+            return self._digital_pan if key == "pan" else self._digital_tilt
         spec = STANDARD_CONTROLS[key]
         value = _V4L2Control(id=spec.control_id, value=0)
         with self._lock:
@@ -260,6 +313,18 @@ class Camera:
         numeric = int(new_value)
         if not spec.minimum <= numeric <= spec.maximum:
             raise ValueError(f"{key} must be between {spec.minimum} and {spec.maximum}")
+        if key == "anti_flicker" and numeric > self.control_maximum(key):
+            # e.g. Auto (3) on firmware that only advertises Disabled/50/60 Hz:
+            # uvcvideo rejects it with ERANGE, so keep the current setting.
+            return self.get_control(key)
+        if self.profile.digital_ptz and key in {"pan", "tilt"}:
+            if key == "pan":
+                self._digital_pan = numeric
+            else:
+                self._digital_tilt = numeric
+            with self._lock:
+                self._digital_ptz_write()
+            return numeric
         wire_value = numeric * 3600 if key in {"pan", "tilt"} else numeric
         value = _V4L2Control(id=spec.control_id, value=wire_value)
         with self._lock:
@@ -269,6 +334,11 @@ class Camera:
     def center(self) -> None:
         # These stay on the cooperative V4L2 path. Some firmware revisions may
         # reject PTZ SET; callers get the kernel error instead of a driver detach.
+        if self.profile.digital_ptz:
+            self._digital_pan = self._digital_tilt = 0
+            self.xu_set(XU_FEATURE_UNIT, XU_PTZ_RESET, bytes(8))
+            self.set_control("zoom", 100)
+            return
         self.set_control("pan", 0)
         self.set_control("tilt", 0)
         self.set_control("zoom", 100)
@@ -335,7 +405,7 @@ class Camera:
         if not raw:
             return "unknown"
         mode_id = raw[0]
-        by_id = {values[0]: key for key, values in VIDEO_MODES.items()}
+        by_id = {values[0]: key for key, values in self.profile.video_modes.items()}
         if mode_id == 0xFF and time.monotonic() - self._last_mode_time < 10:
             return self._last_mode
         return by_id.get(mode_id, "transition" if mode_id == 0xFF else "unknown")
@@ -352,6 +422,11 @@ class Camera:
         payload[0] = mode_id
         if length > 1:
             payload[1] = flag
+        if self.profile.mode_payload_extra and mode_id and length >= 48:
+            # Exactly what Link Controller writes when it enables Auto Framing.
+            payload[38:42] = b"\xff\xff\xff\xff"
+            payload[42:44] = b"\x1a\x0e"
+            payload[46:48] = b"\x1a\x0e"
         self.xu_set(XU_FEATURE_UNIT, XU_VIDEO_MODE, bytes(payload))
 
     def set_video_mode(self, mode: str, verify_streaming: bool = True) -> str:
@@ -363,10 +438,10 @@ class Camera:
         rapid writes known to wedge the device.
         """
 
-        if mode not in VIDEO_MODES:
+        if mode not in self.profile.video_modes:
             raise ValueError(f"unsupported video mode: {mode}")
         self._check_cancelled()
-        mode_id, flag, _label = VIDEO_MODES[mode]
+        mode_id, flag, _label = self.profile.video_modes[mode]
         self._last_mode = mode
         self._last_mode_time = time.monotonic()
 
@@ -452,29 +527,49 @@ class Camera:
         return self.get_tracking_speed()
 
     def get_framing(self) -> str:
+        bit = self.profile.smart_composition_bit
+        if bit is not None and not self.get_feature(bit):
+            return "off"
         current = self.xu_get(XU_FEATURE_UNIT, XU_FRAMING, 1)[0]
-        return next((name for name, value in FRAMING_MODES.items() if value == current), "unknown")
+        modes = self.profile.framing_modes
+        return next(
+            (name for name, value in modes.items() if value == current and name != "off"),
+            "unknown",
+        )
 
     def set_framing(self, framing: str) -> str:
-        value = FRAMING_MODES[framing]
-        self.xu_set(XU_FEATURE_UNIT, XU_FRAMING, bytes([value]))
+        if framing not in self.profile.framing_modes:
+            raise ValueError(f"unsupported framing: {framing}")
+        bit = self.profile.smart_composition_bit
+        if bit is not None and framing == "off":
+            self.set_feature(bit, False)
+            return self.get_framing()
+        self.xu_set(XU_FEATURE_UNIT, XU_FRAMING, bytes([self.profile.framing_modes[framing]]))
+        if bit is not None and not self.get_feature(bit):
+            self.set_feature(bit, True)
         return self.get_framing()
 
+    def _raw_audio_mode(self) -> str:
+        return "original" if self.profile.audio_selector == 0x1F else "music_balance"
+
     def get_noise_cancellation(self) -> bool:
-        return self.get_audio_mode() != "music_balance"
+        return self.get_audio_mode() != self._raw_audio_mode()
 
     def set_noise_cancellation(self, enabled: bool) -> bool:
-        self.set_audio_mode("voice_focus" if enabled else "music_balance")
+        default = next(iter(self.profile.audio_modes))
+        self.set_audio_mode(default if enabled else self._raw_audio_mode())
         return self.get_noise_cancellation()
 
     def get_audio_mode(self) -> str:
-        current = self.xu_get(XU_FEATURE_UNIT, XU_NOISE_CANCEL, 1)[0]
-        return next((name for name, value in AUDIO_MODES.items() if value == current), "unknown")
+        p = self.profile
+        current = self.xu_get(p.audio_unit, p.audio_selector, 1)[0]
+        return next((name for name, value in p.audio_modes.items() if value == current), "unknown")
 
     def set_audio_mode(self, mode: str) -> str:
-        if mode not in AUDIO_MODES:
+        if mode not in self.profile.audio_modes:
             raise ValueError(f"unsupported audio mode: {mode}")
-        self.xu_set(XU_FEATURE_UNIT, XU_NOISE_CANCEL, bytes([AUDIO_MODES[mode]]))
+        p = self.profile
+        self.xu_set(p.audio_unit, p.audio_selector, bytes([p.audio_modes[mode]]))
         return self.get_audio_mode()
 
     def get_privacy(self) -> bool:

@@ -39,9 +39,10 @@ from .constants import (
     ANTI_FLICKER_LABELS,
     APP_NAME,
     FRAMING_MODES,
+    LINK2_PROFILE,
     STANDARD_CONTROLS,
     TRACKING_SPEED_MAX,
-    VIDEO_MODES,
+    ModelProfile,
 )
 from .diagnostics import create_support_bundle
 from .effects import EffectSettings, Rect, TrackingTarget
@@ -97,6 +98,34 @@ def control_dropdown_index(key: str, value: object) -> int | None:
         return choices.index(value)
     except ValueError:
         return None
+
+
+def _camera_profile(camera: object) -> ModelProfile:
+    return getattr(camera, "profile", LINK2_PROFILE)
+
+
+def _camera_control_maximum(camera: object, key: str, default: int) -> int:
+    query = getattr(camera, "control_maximum", None)
+    return query(key) if callable(query) else default
+
+
+def camera_dropdown_index(camera: object, key: str, value: object) -> int | None:
+    """Dropdown index for a state value, using the connected model's option lists."""
+
+    profile = _camera_profile(camera)
+    per_model = {"framing": tuple(profile.framing_modes), "audio_mode": tuple(profile.audio_modes)}
+    if key in per_model:
+        try:
+            return per_model[key].index(value)
+        except ValueError:
+            return None
+    if (
+        key == "anti_flicker"
+        and isinstance(value, int)
+        and value > _camera_control_maximum(camera, key, len(ANTI_FLICKER_LABELS) - 1)
+    ):
+        return None
+    return control_dropdown_index(key, value)
 
 
 def _drain_camera_executor(executor: concurrent.futures.ThreadPoolExecutor, camera: Camera) -> None:
@@ -302,13 +331,14 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         box.set_margin_end(14)
         first = None
         current = str(self.state.get("mode", "normal"))
-        for key in ("normal", "tracking", "whiteboard", "overhead", "deskview"):
-            button = Gtk.ToggleButton(label=VIDEO_MODES[key][2])
+        modes = _camera_profile(self.camera).video_modes
+        for key in modes:
+            button = Gtk.ToggleButton(label=modes[key][2])
             if first:
                 button.set_group(first)
             else:
                 first = button
-            button.set_active(key == current or (current not in VIDEO_MODES and key == "normal"))
+            button.set_active(key == current or (current not in modes and key == "normal"))
             button.connect("toggled", self._compact_mode_toggled, key)
             self._compact_mode_buttons[key] = button
             box.append(button)
@@ -367,8 +397,9 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         mode_bar.add_css_class("link-mode-bar")
         first_button = None
         current_mode = str(self.state.get("mode", "normal"))
-        for key in ("normal", "tracking", "whiteboard", "overhead", "deskview"):
-            label = VIDEO_MODES[key][2]
+        modes = _camera_profile(self.camera).video_modes
+        for key in modes:
+            label = modes[key][2]
             button = Gtk.ToggleButton(label=label)
             button.add_css_class("flat")
             if first_button:
@@ -377,7 +408,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
                 first_button = button
             self._mode_buttons[key] = button
             button.set_active(
-                key == current_mode or (current_mode not in VIDEO_MODES and key == "normal")
+                key == current_mode or (current_mode not in modes and key == "normal")
             )
             button.connect("toggled", self._mode_toggled, key)
             mode_bar.append(button)
@@ -560,7 +591,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
                 elif isinstance(widget, Gtk.SpinButton) and isinstance(value, int | float):
                     widget.set_value(float(value))
                 elif isinstance(widget, Gtk.DropDown):
-                    selected = control_dropdown_index(key, value)
+                    selected = camera_dropdown_index(getattr(self, "camera", None), key, value)
                     if selected is not None:
                         widget.set_selected(selected)
             if "focus_auto" in values and hasattr(self, "focus_row"):
@@ -800,12 +831,16 @@ class LinkStudioWindow(Adw.ApplicationWindow):
                 lambda value, control=key: self._set_standard(control, value),
             )
         anti_flicker = int(self.state.get("anti_flicker", 2))
+        flicker_max = _camera_control_maximum(
+            self.camera, "anti_flicker", len(ANTI_FLICKER_LABELS) - 1
+        )
+        flicker_labels = list(ANTI_FLICKER_LABELS[: flicker_max + 1])
         self._combo_row(
             color,
             "anti_flicker",
             "Anti-flicker",
-            list(ANTI_FLICKER_LABELS),
-            max(0, min(anti_flicker, len(ANTI_FLICKER_LABELS) - 1)),
+            flicker_labels,
+            max(0, min(anti_flicker, len(flicker_labels) - 1)),
             lambda selected: self._set_standard("anti_flicker", selected),
         )
         content.append(color)
@@ -832,7 +867,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             "AI Tracking",
             "Select AI Tracking from the mode bar beneath the preview before adjusting framing.",
         )
-        framing_names = list(FRAMING_MODES)
+        framing_names = list(_camera_profile(self.camera).framing_modes)
         current_framing = str(self.state.get("framing", "head"))
         framing_index = (
             framing_names.index(current_framing) if current_framing in framing_names else 0
@@ -841,7 +876,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             tracking,
             "framing",
             "Smart composition",
-            ["Head", "Half body", "Whole body"],
+            list(_camera_profile(self.camera).framing_labels),
             framing_index,
             lambda selected: self._submit(
                 "Smart composition updated",
@@ -1051,13 +1086,13 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             self._audio_source_changed,
         )
         source_dropdown.set_sensitive(bool(self.audio_sources))
-        audio_modes = ["voice_focus", "voice_suppression", "music_balance"]
-        current_audio_mode = str(self.state.get("audio_mode", "voice_focus"))
+        audio_modes = list(_camera_profile(self.camera).audio_modes)
+        current_audio_mode = str(self.state.get("audio_mode", audio_modes[0]))
         self._combo_row(
             microphone,
             "audio_mode",
             "Audio mode",
-            ["Voice Focus", "Voice Suppression", "Music Balance"],
+            list(_camera_profile(self.camera).audio_labels),
             audio_modes.index(current_audio_mode) if current_audio_mode in audio_modes else 0,
             lambda selected: self._submit(
                 f"Audio mode set to {audio_modes[selected].replace('_', ' ').title()}",
@@ -2205,7 +2240,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             self._updating = False
 
         self._submit(
-            f"{VIDEO_MODES[mode][2]} enabled",
+            f"{_camera_profile(self.camera).video_modes[mode][2]} enabled",
             lambda: self.camera.set_video_mode(mode, verify_streaming=self.preview.running),
             on_success=success,
             on_error=failure,
@@ -2863,7 +2898,8 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             ):
                 if key in values:
                     self.camera.set_feature(bit, bool(values[key]))
-            if "framing" in values and values["framing"] in FRAMING_MODES:
+            framings = _camera_profile(self.camera).framing_modes
+            if "framing" in values and values["framing"] in framings:
                 self.camera.set_framing(str(values["framing"]))
             if "tracking_speed" in values:
                 self.camera.set_tracking_speed(int(values["tracking_speed"]))
@@ -2882,7 +2918,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
                     )
                 self.preview.set_effects(**restored)
             mode = str(values.get("mode", "normal"))
-            if mode in VIDEO_MODES:
+            if mode in _camera_profile(self.camera).video_modes:
                 self.camera.set_video_mode(mode, verify_streaming=self.preview.running)
             return mode, self.camera.read_state()
 

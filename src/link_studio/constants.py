@@ -11,6 +11,7 @@ SUPPORTED_PRODUCTS = {
     0x4C02: "Insta360 Link 2C",
     0x4C03: "Insta360 Link 2 Pro",
     0x4C04: "Insta360 Link 2",
+    0x4C05: "Insta360 Link 2C Pro",
 }
 
 
@@ -63,3 +64,56 @@ TRACKING_SPEED_MAX = 255
 # firmware value is Voice Focus. Music Balance is the unprocessed/no-denoise
 # mode exposed by the official client.
 AUDIO_MODES = {"music_balance": 0, "voice_focus": 1, "voice_suppression": 2}
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    """Per-model differences in the vendor protocol and the UI options they allow."""
+
+    key: str
+    video_modes: dict[str, tuple[int, int, str]]
+    framing_modes: dict[str, int]
+    framing_labels: tuple[str, ...]
+    audio_modes: dict[str, int]
+    audio_labels: tuple[str, ...]
+    audio_unit: int = 9
+    audio_selector: int = 0x07
+    # 2C Pro: pan/tilt are a digital crop window (XU10 selector 0x13), not a gimbal.
+    digital_ptz: bool = False
+    # 2C Pro: feature-mask bit 0 is "Smart composition"; framing only applies with it on.
+    smart_composition_bit: int | None = None
+    # 2C Pro: Link Controller fills bytes 38-47 of the 61-byte mode payload on enable.
+    mode_payload_extra: bool = False
+
+
+LINK2_PROFILE = ModelProfile(
+    key="link2",
+    video_modes=VIDEO_MODES,
+    framing_modes=FRAMING_MODES,
+    framing_labels=("Head", "Half body", "Whole body"),
+    audio_modes={"voice_focus": 1, "voice_suppression": 2, "music_balance": 0},
+    audio_labels=("Voice Focus", "Voice Suppression", "Music Balance"),
+)
+
+# Insta360 Link 2C Pro (2e1a:4c05), decoded from Link Controller USB captures on
+# firmware v0.3.5.8_build3 (2026-11-13). No gimbal, so there are no Whiteboard,
+# Overhead or DeskView modes; "AI Tracking" is Auto Framing (mode 0x07).
+LINK2C_PRO_PROFILE = ModelProfile(
+    key="link2c_pro",
+    video_modes={"normal": (0x00, 0x00, "Normal"), "tracking": (0x07, 0x00, "Auto Framing")},
+    framing_modes={"off": 0, "head": 1, "half_body": 2},
+    framing_labels=("Off", "Head", "Half body"),
+    audio_modes={"standard": 0, "wide": 1, "focus": 2, "original": 3},
+    audio_labels=("Standard", "Wide", "Focus", "Original"),
+    audio_unit=10,
+    audio_selector=0x1F,
+    digital_ptz=True,
+    smart_composition_bit=0,
+    mode_payload_extra=True,
+)
+
+MODEL_PROFILES = {0x4C05: LINK2C_PRO_PROFILE}
+
+
+def profile_for(product_id: int) -> ModelProfile:
+    return MODEL_PROFILES.get(product_id, LINK2_PROFILE)
