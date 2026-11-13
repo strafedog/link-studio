@@ -2,7 +2,13 @@ import struct
 import threading
 import unittest
 
-from link_studio.camera import VIDIOC_QUERYCTRL, Camera, _V4L2QueryControl
+from link_studio.camera import (
+    VIDIOC_QUERYCTRL,
+    Camera,
+    _V4L2QueryControl,
+    digital_ptz_angles,
+    digital_ptz_position,
+)
 from link_studio.constants import LINK2_PROFILE, LINK2C_PRO_PROFILE, profile_for
 
 
@@ -113,6 +119,13 @@ class Link2CProProfileTests(unittest.TestCase):
         camera.set_deskview_correction(80)
         self.assertEqual(state[(9, 0x02)][52:54], bytes.fromhex("9cff"))
         self.assertEqual(state[(9, 0x02)][0], 0x06)
+
+    def test_minimap_position_round_trips(self):
+        for pan, tilt in ((0, 0), (-145, 100), (145, -90), (60, 40), (-30, -45)):
+            x, y = digital_ptz_position(pan, tilt)
+            back = digital_ptz_angles(x / 0xFFFF, y / 0xFFFF)
+            self.assertLessEqual(abs(back[0] - pan), 1)
+            self.assertLessEqual(abs(back[1] - tilt), 1)
 
 
 if __name__ == "__main__":

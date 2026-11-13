@@ -34,6 +34,8 @@ from .camera import (
     FEATURE_HDR,
     FEATURE_MIRROR,
     Camera,
+    digital_ptz_angles,
+    digital_ptz_position,
 )
 from .constants import (
     ANTI_FLICKER_LABELS,
@@ -69,6 +71,7 @@ from .remote import RemoteServer
 from .storage import StorageSettings
 from .teleprompter import ScriptStore, TeleprompterWindow
 from .theme import OmarchyThemeBridge, Palette
+from .view_widgets import CropMinimap, MicPatternIcon
 
 LOGGER = logging.getLogger("link_studio.window")
 
@@ -584,6 +587,9 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         previous_updating = self._updating
         self._updating = True
         try:
+            checks = getattr(self, "_audio_mode_checks", {})
+            if "audio_mode" in values and values["audio_mode"] in checks:
+                checks[values["audio_mode"]].set_active(True)
             for key, value in values.items():
                 widget = self._control_widgets.get(key)
                 if isinstance(widget, Gtk.Switch):
@@ -647,8 +653,84 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         self._refresh_preset_list()
         return page
 
+    def _build_digital_view_group(self) -> Adw.PreferencesGroup:
+        group = self._group("View", "Drag the box to reframe the digital crop; zoom with + and −.")
+        reset = Gtk.Button(icon_name="view-refresh-symbolic", valign=Gtk.Align.CENTER)
+        reset.add_css_class("flat")
+        reset.set_tooltip_text("Reset view (centre, 1.0×)")
+        reset.connect("clicked", lambda *_args: self._center_camera())
+        group.set_header_suffix(reset)
+
+        def get_view() -> tuple[int, float, float]:
+            x, y = digital_ptz_position(
+                int(self.state.get("pan", 0)), int(self.state.get("tilt", 0))
+            )
+            return int(self.state.get("zoom", 100)), x / 0xFFFF, y / 0xFFFF
+
+        def moved(x: float, y: float) -> None:
+            pan, tilt = digital_ptz_angles(x, y)
+            self.state["pan"], self.state["tilt"] = pan, tilt
+            self._debounce(
+                "digital_view", lambda: self.camera.set_digital_view(pan, tilt), delay_ms=60
+            )
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_halign(Gtk.Align.CENTER)
+        self._view_minimap = CropMinimap(get_view, moved)
+        box.append(self._view_minimap)
+
+        zoom_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        zoom_column.set_valign(Gtk.Align.CENTER)
+        zoom_column.add_css_class("card")
+        zoom_column.set_margin_start(4)
+        zoom_in = Gtk.Button(icon_name="list-add-symbolic")
+        zoom_out = Gtk.Button(icon_name="list-remove-symbolic")
+        for button in (zoom_in, zoom_out):
+            button.add_css_class("flat")
+            button.add_css_class("circular")
+        self._view_zoom_label = Gtk.Label(label="1.0×")
+        self._view_zoom_label.set_width_chars(5)
+        zoom_in.connect("clicked", lambda *_args: self._step_digital_zoom(10))
+        zoom_out.connect("clicked", lambda *_args: self._step_digital_zoom(-10))
+        zoom_column.append(zoom_in)
+        zoom_column.append(self._view_zoom_label)
+        zoom_column.append(zoom_out)
+        box.append(zoom_column)
+
+        row = Adw.PreferencesRow(activatable=False)
+        row.set_child(box)
+        group.add(row)
+        self._view_last_drawn: tuple[object, ...] | None = None
+        GLib.timeout_add(250, self._refresh_digital_view)
+        return group
+
+    def _step_digital_zoom(self, delta: int) -> None:
+        zoom = max(100, min(400, int(self.state.get("zoom", 100)) + delta))
+        pan, tilt = int(self.state.get("pan", 0)), int(self.state.get("tilt", 0))
+        self.state["zoom"] = zoom
+        self._refresh_digital_view()
+        self._debounce(
+            "digital_view", lambda: self.camera.set_digital_view(pan, tilt, zoom), delay_ms=60
+        )
+
+    def _refresh_digital_view(self) -> bool:
+        minimap = getattr(self, "_view_minimap", None)
+        if minimap is None:
+            return False
+        current = (self.state.get("zoom"), self.state.get("pan"), self.state.get("tilt"))
+        if current != self._view_last_drawn:
+            self._view_last_drawn = current
+            self._view_zoom_label.set_label(f"{int(self.state.get('zoom', 100)) / 100:.1f}×")
+            minimap.queue_draw()
+        return True
+
     def _build_view_page(self) -> Gtk.Widget:
         page, content = self._page()
+        digital = _camera_profile(self.camera).digital_ptz
+        if digital:
+            content.append(self._build_digital_view_group())
         direction = self._group("Gimbal", "Move in 5° steps using cooperative V4L2 controls.")
         grid_row = self._action_row("Direction")
         grid = Gtk.Grid(row_spacing=6, column_spacing=6, halign=Gtk.Align.CENTER)
@@ -685,7 +767,8 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             "Digital zoom up to 4×",
             "%",
         )
-        content.append(direction)
+        if not digital:
+            content.append(direction)
 
         orientation = self._group("Orientation")
         self._switch_row(
@@ -710,7 +793,9 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             "Privacy mode",
             bool(self.state.get("privacy", False)),
             self._set_privacy,
-            "Tilts the Link 2 down and stops its camera stream",
+            "Stops the camera stream"
+            if digital
+            else "Tilts the Link 2 down and stops its camera stream",
         )
         content.append(orientation)
 
@@ -748,14 +833,16 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             lambda active: self._set_feature("hdr", FEATURE_HDR, active),
             "Unavailable at 4K and high-frame-rate modes",
         )
+        profile = _camera_profile(self.camera)
         auto_exposure = bool(self.state.get("auto_exposure", True))
-        self.auto_exposure_switch = self._switch_row(
-            exposure,
-            "auto_exposure",
-            "Automatic exposure",
-            auto_exposure,
-            self._set_auto_exposure,
-        )
+        if profile.manual_exposure:
+            self.auto_exposure_switch = self._switch_row(
+                exposure,
+                "auto_exposure",
+                "Automatic exposure",
+                auto_exposure,
+                self._set_auto_exposure,
+            )
         self._spin_row(
             exposure,
             "exposure_compensation",
@@ -770,6 +857,10 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             ),
             "50 is neutral; range is approximately −3 EV to +3 EV",
         )
+        if not profile.manual_exposure:
+            content.append(exposure)
+            self._build_color_group(content)
+            return page
         self.iso_row = self._spin_row(
             exposure,
             "iso",
@@ -796,7 +887,10 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         self.iso_row.set_sensitive(not auto_exposure)
         self.shutter_row.set_sensitive(not auto_exposure)
         content.append(exposure)
+        self._build_color_group(content)
+        return page
 
+    def _build_color_group(self, content: Gtk.Box) -> None:
         color = self._group("White balance and color")
         auto_white = bool(self.state.get("white_balance_auto", True))
         self.white_balance_switch = self._switch_row(
@@ -818,7 +912,10 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             unit="K",
         )
         self.white_balance_row.set_sensitive(not auto_white)
+        hidden = _camera_profile(self.camera).hidden_controls
         for key in ("brightness", "contrast", "saturation", "hue", "sharpness"):
+            if key in hidden:
+                continue
             spec = STANDARD_CONTROLS[key]
             self._spin_row(
                 color,
@@ -859,7 +956,6 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         self.color_preset_list.add_css_class("boxed-list")
         content.append(self.color_preset_list)
         self._refresh_color_preset_list()
-        return page
 
     def _build_smart_page(self) -> Gtk.Widget:
         page, content = self._page()
@@ -1105,7 +1201,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
 
     def _build_audio_page(self) -> Gtk.Widget:
         page, content = self._page()
-        microphone = self._group("Link 2 microphone")
+        microphone = self._group(f"{getattr(self.camera.device, 'model', 'Link 2')} microphone")
         source_labels = [source.description for source in self.audio_sources] or ["No input found"]
         selected_source = self.selected_audio_source
         selected_index = (
@@ -1122,20 +1218,51 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             self._audio_source_changed,
         )
         source_dropdown.set_sensitive(bool(self.audio_sources))
-        audio_modes = list(_camera_profile(self.camera).audio_modes)
+        profile = _camera_profile(self.camera)
+        audio_modes = list(profile.audio_modes)
         current_audio_mode = str(self.state.get("audio_mode", audio_modes[0]))
-        self._combo_row(
-            microphone,
-            "audio_mode",
-            "Audio mode",
-            list(_camera_profile(self.camera).audio_labels),
-            audio_modes.index(current_audio_mode) if current_audio_mode in audio_modes else 0,
-            lambda selected: self._submit(
-                f"Audio mode set to {audio_modes[selected].replace('_', ' ').title()}",
-                lambda: self.camera.set_audio_mode(audio_modes[selected]),
-            ),
-            "Link 2 microphone processing; Music Balance preserves music and ambient sound",
-        )
+        if profile.audio_descriptions:
+            self._audio_mode_checks: dict[str, Gtk.CheckButton] = {}
+            modes_group = self._group("Audio mode", "Processing done by the camera's microphone.")
+            first_check: Gtk.CheckButton | None = None
+            for key, label in zip(audio_modes, profile.audio_labels, strict=True):
+                row = self._action_row(label, profile.audio_descriptions.get(key))
+                row.set_subtitle_lines(3)
+                check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+                if first_check:
+                    check.set_group(first_check)
+                else:
+                    first_check = check
+                check.set_active(key == current_audio_mode)
+                row.add_prefix(check)
+                row.add_suffix(MicPatternIcon(key))
+                row.set_activatable_widget(check)
+
+                def toggled(button: Gtk.CheckButton, mode: str = key, title: str = label) -> None:
+                    if button.get_active() and not self._updating:
+                        self._submit(
+                            f"Audio mode set to {title}",
+                            lambda: self.camera.set_audio_mode(mode),
+                            on_success=lambda result: self.state.__setitem__("audio_mode", result),
+                        )
+
+                check.connect("toggled", toggled)
+                self._audio_mode_checks[key] = check
+                modes_group.add(row)
+            self._audio_modes_group = modes_group
+        else:
+            self._combo_row(
+                microphone,
+                "audio_mode",
+                "Audio mode",
+                list(profile.audio_labels),
+                audio_modes.index(current_audio_mode) if current_audio_mode in audio_modes else 0,
+                lambda selected: self._submit(
+                    f"Audio mode set to {audio_modes[selected].replace('_', ' ').title()}",
+                    lambda: self.camera.set_audio_mode(audio_modes[selected]),
+                ),
+                "Link 2 microphone processing; Music Balance preserves music and ambient sound",
+            )
         self.audio_mute_switch = self._switch_row(
             microphone,
             "audio_mute",
@@ -1166,6 +1293,8 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             )
             microphone.add(details)
         content.append(microphone)
+        if profile.audio_descriptions:
+            content.append(self._audio_modes_group)
         return page
 
     def _build_tools_page(self) -> Gtk.Widget:

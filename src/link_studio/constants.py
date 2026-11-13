@@ -88,6 +88,12 @@ class ModelProfile:
     gesture_bits: dict[str, int] | None = None
     # 2C Pro: DeskView vertical correction lives in bytes 52-53 of the mode payload.
     deskview_correction: bool = False
+    # Standard controls the firmware exposes but that measurably do nothing.
+    hidden_controls: frozenset[str] = frozenset()
+    # 2C Pro: manual ISO/shutter via XU9 0x19/0x1D give a black picture; auto only.
+    manual_exposure: bool = True
+    # One-line explanations shown under each audio mode.
+    audio_descriptions: dict[str, str] | None = None
 
 
 LINK2_PROFILE = ModelProfile(
@@ -122,6 +128,18 @@ LINK2C_PRO_PROFILE = ModelProfile(
     mode_payload_extra=True,
     gesture_bits={"gesture_framing": 0x02, "gesture_zoom": 0x04, "gesture_whiteboard": 0x08},
     deskview_correction=True,
+    hidden_controls=frozenset({"hue"}),
+    manual_exposure=False,
+    audio_descriptions={
+        "standard": "Everyday use. Picks up the room, lifts voices and trims some "
+        "background noise.",
+        "wide": "Meetings with several people in front of the camera. Keeps voices in "
+        "front, cuts noise and voices from behind.",
+        "focus": "Noisy places. Narrow pickup about 1 m in front; suppresses other "
+        "voices and background noise.",
+        "original": "No noise reduction. Records the room as it sounds, for the most "
+        "natural audio.",
+    },
 )
 
 MODEL_PROFILES = {0x4C05: LINK2C_PRO_PROFILE}

@@ -140,6 +140,29 @@ XU_DIGITAL_PTZ_UNIT = 10
 XU_DIGITAL_PTZ = 0x13
 DIGITAL_PTZ_CENTER = (0x8000, 0x7D09)
 
+
+def digital_ptz_position(pan: int, tilt: int) -> tuple[int, int]:
+    """Map pan (-145..145) and tilt (-90..100, up positive) to 2C Pro crop x/y."""
+
+    cx, cy = DIGITAL_PTZ_CENTER
+    x = cx + round(pan / 145 * 0x7FFF)
+    up, down = cy, 0xFFFF - cy
+    y = cy - round(tilt / 100 * up) if tilt >= 0 else cy + round(-tilt / 90 * down)
+    return max(0, min(0xFFFF, x)), max(0, min(0xFFFF, y))
+
+
+def digital_ptz_angles(x: float, y: float) -> tuple[int, int]:
+    """Inverse of digital_ptz_position for a crop centre in 0..1 frame coordinates."""
+
+    cx, cy = DIGITAL_PTZ_CENTER
+    raw_x, raw_y = x * 0xFFFF, y * 0xFFFF
+    pan = round((raw_x - cx) / 0x7FFF * 145)
+    if raw_y <= cy:
+        tilt = round((cy - raw_y) / cy * 100)
+    else:
+        tilt = -round((raw_y - cy) / (0xFFFF - cy) * 90)
+    return max(-145, min(145, pan)), max(-90, min(100, tilt))
+
 FEATURE_HDR = 2
 FEATURE_MIRROR = 3
 FEATURE_GESTURE_ZOOM = 4
@@ -289,14 +312,25 @@ class Camera:
 
     def _digital_ptz_write(self) -> None:
         zoom = self.get_control("zoom")
-        pan, tilt = self._digital_pan, self._digital_tilt
-        cx, cy = DIGITAL_PTZ_CENTER
-        x = cx + round(pan / 145 * 0x7FFF)
-        y = cy - round(tilt / (100 if tilt >= 0 else 90) * (cy if tilt >= 0 else 0xFFFF - cy))
-        x, y = max(0, min(0xFFFF, x)), max(0, min(0xFFFF, y))
+        x, y = digital_ptz_position(self._digital_pan, self._digital_tilt)
         self.xu_set(
             XU_DIGITAL_PTZ_UNIT, XU_DIGITAL_PTZ, struct.pack("<HHHBB", zoom, x, y, 0x14, 0x14)
         )
+
+    def set_digital_view(
+        self, pan: int, tilt: int, zoom: int | None = None
+    ) -> tuple[int, int, int]:
+        """Move (and optionally zoom) the 2C Pro crop window in a single vendor write."""
+
+        if not self.profile.digital_ptz:
+            raise CameraError("this camera has a gimbal; use pan/tilt controls")
+        with self._lock:
+            if zoom is not None:
+                self.set_control("zoom", zoom)
+            self._digital_pan = max(-145, min(145, int(pan)))
+            self._digital_tilt = max(-90, min(100, int(tilt)))
+            self._digital_ptz_write()
+        return self._digital_pan, self._digital_tilt, self.get_control("zoom")
 
     def get_control(self, key: str) -> int:
         if self.profile.digital_ptz and key in {"pan", "tilt"}:
@@ -540,6 +574,9 @@ class Camera:
         return self.xu_get(XU_FEATURE_UNIT, XU_AUTO_EXPOSURE, 1)[0] == 2
 
     def set_auto_exposure(self, enabled: bool) -> bool:
+        if not enabled and not self.profile.manual_exposure:
+            # Manual exposure blacks out the 2C Pro picture; stay on auto.
+            return self.get_auto_exposure()
         self.xu_set(XU_FEATURE_UNIT, XU_AUTO_EXPOSURE, bytes([2 if enabled else 1]))
         return self.get_auto_exposure()
 
