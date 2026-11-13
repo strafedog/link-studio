@@ -670,9 +670,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         def moved(x: float, y: float) -> None:
             pan, tilt = digital_ptz_angles(x, y)
             self.state["pan"], self.state["tilt"] = pan, tilt
-            self._debounce(
-                "digital_view", lambda: self.camera.set_digital_view(pan, tilt), delay_ms=60
-            )
+            self._push_digital_view()
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         box.set_margin_top(12)
@@ -708,11 +706,41 @@ class LinkStudioWindow(Adw.ApplicationWindow):
 
     def _step_digital_zoom(self, delta: int) -> None:
         zoom = max(100, min(400, int(self.state.get("zoom", 100)) + delta))
-        pan, tilt = int(self.state.get("pan", 0)), int(self.state.get("tilt", 0))
         self.state["zoom"] = zoom
         self._refresh_digital_view()
-        self._debounce(
-            "digital_view", lambda: self.camera.set_digital_view(pan, tilt, zoom), delay_ms=60
+        self._push_digital_view(zoom_changed=True)
+
+    # Link Controller streams crop positions roughly every 80-120 ms while dragging and
+    # the firmware glides between them, so send the latest position at that rate
+    # (never queueing stale ones) rather than waiting for the drag to pause.
+    _DIGITAL_VIEW_INTERVAL_MS = 80
+
+    def _push_digital_view(self, zoom_changed: bool = False) -> None:
+        self._digital_view_dirty = True
+        self._digital_zoom_dirty = getattr(self, "_digital_zoom_dirty", False) or zoom_changed
+        if getattr(self, "_digital_view_busy", False):
+            return
+        self._digital_view_busy = True
+        self._digital_view_dirty = False
+        pan, tilt = int(self.state.get("pan", 0)), int(self.state.get("tilt", 0))
+        zoom = int(self.state.get("zoom", 100)) if self._digital_zoom_dirty else None
+        self._digital_zoom_dirty = False
+
+        def done(_result: object = None) -> None:
+            GLib.timeout_add(self._DIGITAL_VIEW_INTERVAL_MS, release)
+
+        def release() -> bool:
+            self._digital_view_busy = False
+            if self._digital_view_dirty:
+                self._push_digital_view()
+            return False
+
+        self._submit(
+            "",
+            lambda: self.camera.set_digital_view(pan, tilt, zoom),
+            on_success=done,
+            on_error=done,
+            quiet=True,
         )
 
     def _refresh_digital_view(self) -> bool:
@@ -787,16 +815,17 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             self._orientation_changed,
             "Applied to preview, recordings, screenshots, and the virtual camera",
         )
-        self._switch_row(
-            orientation,
-            "privacy",
-            "Privacy mode",
-            bool(self.state.get("privacy", False)),
-            self._set_privacy,
-            "Stops the camera stream"
-            if digital
-            else "Tilts the Link 2 down and stops its camera stream",
-        )
+        if _camera_profile(self.camera).privacy:
+            self._switch_row(
+                orientation,
+                "privacy",
+                "Privacy mode",
+                bool(self.state.get("privacy", False)),
+                self._set_privacy,
+                "Stops the camera stream"
+                if digital
+                else "Tilts the Link 2 down and stops its camera stream",
+            )
         content.append(orientation)
 
         focus = self._group("Focus")
@@ -979,19 +1008,20 @@ class LinkStudioWindow(Adw.ApplicationWindow):
                 lambda: self.camera.set_framing(framing_names[selected]),
             ),
         )
-        self._spin_row(
-            tracking,
-            "tracking_speed",
-            "Tracking speed",
-            int(self.state.get("tracking_speed", 1)),
-            0,
-            TRACKING_SPEED_MAX,
-            1,
-            lambda value: self._debounce(
-                "tracking_speed", lambda: self.camera.set_tracking_speed(value)
-            ),
-            "Full firmware range",
-        )
+        if _camera_profile(self.camera).tracking_speed:
+            self._spin_row(
+                tracking,
+                "tracking_speed",
+                "Tracking speed",
+                int(self.state.get("tracking_speed", 1)),
+                0,
+                TRACKING_SPEED_MAX,
+                1,
+                lambda value: self._debounce(
+                    "tracking_speed", lambda: self.camera.set_tracking_speed(value)
+                ),
+                "Full firmware range",
+            )
         self._combo_row(
             tracking,
             "tracking_engine",

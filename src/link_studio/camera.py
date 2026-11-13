@@ -163,6 +163,7 @@ def digital_ptz_angles(x: float, y: float) -> tuple[int, int]:
         tilt = -round((raw_y - cy) / (0xFFFF - cy) * 90)
     return max(-145, min(145, pan)), max(-90, min(100, tilt))
 
+
 FEATURE_HDR = 2
 FEATURE_MIRROR = 3
 FEATURE_GESTURE_ZOOM = 4
@@ -310,16 +311,14 @@ class Camera:
             return spec.maximum
         return min(spec.maximum, query.maximum)
 
-    def _digital_ptz_write(self) -> None:
-        zoom = self.get_control("zoom")
+    def _digital_ptz_write(self, zoom: int | None = None) -> None:
+        zoom = self.get_control("zoom") if zoom is None else zoom
         x, y = digital_ptz_position(self._digital_pan, self._digital_tilt)
         self.xu_set(
             XU_DIGITAL_PTZ_UNIT, XU_DIGITAL_PTZ, struct.pack("<HHHBB", zoom, x, y, 0x14, 0x14)
         )
 
-    def set_digital_view(
-        self, pan: int, tilt: int, zoom: int | None = None
-    ) -> tuple[int, int, int]:
+    def set_digital_view(self, pan: int, tilt: int, zoom: int | None = None) -> tuple[int, int]:
         """Move (and optionally zoom) the 2C Pro crop window in a single vendor write."""
 
         if not self.profile.digital_ptz:
@@ -329,8 +328,8 @@ class Camera:
                 self.set_control("zoom", zoom)
             self._digital_pan = max(-145, min(145, int(pan)))
             self._digital_tilt = max(-90, min(100, int(tilt)))
-            self._digital_ptz_write()
-        return self._digital_pan, self._digital_tilt, self.get_control("zoom")
+            self._digital_ptz_write(zoom)
+        return self._digital_pan, self._digital_tilt
 
     def get_control(self, key: str) -> int:
         if self.profile.digital_ptz and key in {"pan", "tilt"}:

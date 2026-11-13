@@ -94,6 +94,9 @@ class ModelProfile:
     manual_exposure: bool = True
     # One-line explanations shown under each audio mode.
     audio_descriptions: dict[str, str] | None = None
+    # Gimbal-only extras: tracking (motor) speed and the tilt-down privacy mode.
+    tracking_speed: bool = True
+    privacy: bool = True
 
 
 LINK2_PROFILE = ModelProfile(
@@ -130,6 +133,8 @@ LINK2C_PRO_PROFILE = ModelProfile(
     deskview_correction=True,
     hidden_controls=frozenset({"hue"}),
     manual_exposure=False,
+    tracking_speed=False,
+    privacy=False,
     audio_descriptions={
         "standard": "Everyday use. Picks up the room, lifts voices and trims some "
         "background noise.",
