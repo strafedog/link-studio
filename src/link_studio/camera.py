@@ -468,7 +468,13 @@ class Camera:
         by_id = {values[0]: key for key, values in self.profile.video_modes.items()}
         if mode_id == 0xFF and time.monotonic() - self._last_mode_time < 10:
             return self._last_mode
-        return by_id.get(mode_id, "transition" if mode_id == 0xFF else "unknown")
+        mode = by_id.get(mode_id, "transition" if mode_id == 0xFF else "unknown")
+        bit = self.profile.smart_composition_bit
+        if mode == "normal" and bit is not None and self.get_feature(bit):
+            # 2C Pro: Smart composition alone keeps auto-framing even in mode 0x00
+            # (e.g. left on by another client), so report what the camera is doing.
+            return "tracking"
+        return mode
 
     def _write_video_mode_buffer(self, mode_id: int, flag: int) -> None:
         length = self.xu_length(XU_FEATURE_UNIT, XU_VIDEO_MODE, 61)
@@ -506,6 +512,11 @@ class Camera:
         self._last_mode_time = time.monotonic()
 
         if mode == "normal":
+            bit = self.profile.smart_composition_bit
+            if bit is not None and self.get_feature(bit):
+                # Link Controller turns Smart composition off before Auto Framing;
+                # otherwise the camera keeps framing in normal mode.
+                self.set_feature(bit, False)
             self._write_video_mode_buffer(mode_id, flag)
             return mode
 

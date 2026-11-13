@@ -17,6 +17,7 @@ def _fake_2c_pro(feature_mask: int = 0x01C4, framing: int = 1, audio: int = 0):
     camera.profile = LINK2C_PRO_PROFILE
     camera._digital_pan = camera._digital_tilt = 0
     camera._lock = threading.RLock()
+    camera._cancel_operations = threading.Event()
     state = {
         (9, 0x1B): feature_mask.to_bytes(2, "little"),
         (9, 0x13): bytes([framing]),
@@ -148,6 +149,15 @@ class Link2CProProfileTests(unittest.TestCase):
             again.profile = LINK2C_PRO_PROFILE
             again._load_digital_view()
             self.assertEqual((again._digital_pan, again._digital_tilt), (50, 20))
+
+    def test_smart_composition_counts_as_auto_framing(self):
+        camera, _writes, state = _fake_2c_pro(feature_mask=0x01C5)
+        camera._last_mode_time = 0.0
+        state[(9, 0x02)] = bytes(61)
+        self.assertEqual(camera.read_video_mode(), "tracking")
+        camera.set_video_mode("normal")
+        self.assertEqual(int.from_bytes(state[(9, 0x1B)], "little") & 1, 0)
+        self.assertEqual(camera.read_video_mode(), "normal")
 
 
 if __name__ == "__main__":
