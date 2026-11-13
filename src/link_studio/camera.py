@@ -133,6 +133,7 @@ XU_SHUTTER = 0x1D
 XU_AUTO_EXPOSURE = 0x1E
 XU_PRIVACY = 0x0F
 XU_PTZ_RESET = 0x1A
+XU_GESTURES = 0x05
 # Link 2C Pro digital pan/tilt window: <u16 zoom><u16 x><u16 y><u8 0x14><u8 0x14>,
 # x/y 0..0xFFFF across the sensor, smaller y is up. Values as Link Controller sends.
 XU_DIGITAL_PTZ_UNIT = 10
@@ -482,6 +483,49 @@ class Camera:
                 reassert_at = time.monotonic() + 2.5
         raise CameraError(f"camera did not settle into {mode} mode while streaming")
 
+    def get_gesture(self, name: str) -> bool:
+        bits = self.profile.gesture_bits or {}
+        if name not in bits:
+            raise ValueError(f"unsupported gesture: {name}")
+        if not self.get_feature(FEATURE_GESTURE_ZOOM):
+            return False
+        return bool(self.xu_get(XU_FEATURE_UNIT, XU_GESTURES, 1)[0] & bits[name])
+
+    def set_gesture(self, name: str, enabled: bool) -> bool:
+        """Toggle one 2C Pro hand gesture; the master bit follows "any gesture enabled"."""
+
+        bits = self.profile.gesture_bits or {}
+        if name not in bits:
+            raise ValueError(f"unsupported gesture: {name}")
+        with self._lock:
+            current = self.xu_get(XU_FEATURE_UNIT, XU_GESTURES, 1)[0]
+            if not self.get_feature(FEATURE_GESTURE_ZOOM):
+                current = 0
+            mask = (current | bits[name]) if enabled else (current & ~bits[name])
+            mask &= sum(bits.values())
+            # Same order as Link Controller: master bit first, then the gesture mask.
+            self.set_feature(FEATURE_GESTURE_ZOOM, bool(mask))
+            self.xu_set(XU_FEATURE_UNIT, XU_GESTURES, bytes([mask]))
+        return self.get_gesture(name)
+
+    def get_deskview_correction(self) -> int:
+        raw = self.xu_get(XU_FEATURE_UNIT, XU_VIDEO_MODE, 61)
+        return 90 + struct.unpack_from("<h", raw, 52)[0] // 10
+
+    def set_deskview_correction(self, degrees: int) -> int:
+        """DeskView vertical correction, 10-80 (Link Controller default 45)."""
+
+        if not self.profile.deskview_correction:
+            raise CameraError("this camera has no DeskView correction control")
+        degrees = max(10, min(80, int(degrees)))
+        with self._lock:
+            payload = bytearray(self.xu_get(XU_FEATURE_UNIT, XU_VIDEO_MODE, 61))
+            if payload[0] == 0xFF:
+                raise CameraError("camera is switching modes; try again")
+            struct.pack_into("<h", payload, 52, (degrees - 90) * 10)
+            self.xu_set(XU_FEATURE_UNIT, XU_VIDEO_MODE, bytes(payload))
+        return self.get_deskview_correction()
+
     def get_exposure_compensation(self) -> int:
         raw = self.xu_get(XU_FEATURE_UNIT, XU_EXPOSURE_COMP, 2)
         return max(0, min(100, struct.unpack("<h", raw[:2])[0] // 6 + 50))
@@ -642,6 +686,10 @@ class Camera:
             "shutter_us": self.get_shutter,
             "device_information": self.get_device_information,
         }
+        for name in self.profile.gesture_bits or {}:
+            custom_readers[name] = lambda name=name: self.get_gesture(name)
+        if self.profile.deskview_correction:
+            custom_readers["deskview_correction"] = self.get_deskview_correction
         for key, reader in custom_readers.items():
             try:
                 state[key] = reader()

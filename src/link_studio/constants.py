@@ -84,6 +84,10 @@ class ModelProfile:
     smart_composition_bit: int | None = None
     # 2C Pro: Link Controller fills bytes 38-47 of the 61-byte mode payload on enable.
     mode_payload_extra: bool = False
+    # 2C Pro: per-gesture bits on XU9 selector 0x05; feature bit 4 is the master switch.
+    gesture_bits: dict[str, int] | None = None
+    # 2C Pro: DeskView vertical correction lives in bytes 52-53 of the mode payload.
+    deskview_correction: bool = False
 
 
 LINK2_PROFILE = ModelProfile(
@@ -96,11 +100,17 @@ LINK2_PROFILE = ModelProfile(
 )
 
 # Insta360 Link 2C Pro (2e1a:4c05), decoded from Link Controller USB captures on
-# firmware v0.3.5.8_build3 (2026-11-13). No gimbal, so there are no Whiteboard,
-# Overhead or DeskView modes; "AI Tracking" is Auto Framing (mode 0x07).
+# firmware v0.3.5.8_build3 (2026-11-13). No gimbal and no Overhead mode; "AI Tracking"
+# is Auto Framing (mode 0x07). Smart Whiteboard (0x0A detect, 0x08 + corner quad) is
+# not wired up: Link Controller finds the board in the video itself.
 LINK2C_PRO_PROFILE = ModelProfile(
     key="link2c_pro",
-    video_modes={"normal": (0x00, 0x00, "Normal"), "tracking": (0x07, 0x00, "Auto Framing")},
+    video_modes={
+        "normal": (0x00, 0x00, "Normal"),
+        "tracking": (0x07, 0x00, "Auto Framing"),
+        "whiteboard": (0x04, 0x00, "Whiteboard"),
+        "deskview": (0x06, 0x00, "DeskView"),
+    },
     framing_modes={"off": 0, "head": 1, "half_body": 2},
     framing_labels=("Off", "Head", "Half body"),
     audio_modes={"standard": 0, "wide": 1, "focus": 2, "original": 3},
@@ -110,6 +120,8 @@ LINK2C_PRO_PROFILE = ModelProfile(
     digital_ptz=True,
     smart_composition_bit=0,
     mode_payload_extra=True,
+    gesture_bits={"gesture_framing": 0x02, "gesture_zoom": 0x04, "gesture_whiteboard": 0x08},
+    deskview_correction=True,
 )
 
 MODEL_PROFILES = {0x4C05: LINK2C_PRO_PROFILE}

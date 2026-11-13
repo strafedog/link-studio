@@ -934,7 +934,43 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         regions.add(pause_row)
         content.append(regions)
 
+        profile = _camera_profile(self.camera)
+        if profile.deskview_correction:
+            deskview = self._group(
+                "DeskView", "Vertical correction for the desk area while DeskView is active."
+            )
+            self._spin_row(
+                deskview,
+                "deskview_correction",
+                "Vertical correction",
+                int(self.state.get("deskview_correction", 45)),
+                10,
+                80,
+                1,
+                lambda value: self._debounce(
+                    "deskview_correction", lambda: self.camera.set_deskview_correction(value)
+                ),
+                "Degrees; Link Controller default 45",
+            )
+            content.append(deskview)
+
         gestures = self._group("Gesture control")
+        if profile.gesture_bits:
+            for key, title, subtitle in (
+                ("gesture_framing", "Auto Framing gesture", "Open hand toggles Auto Framing"),
+                ("gesture_whiteboard", "Whiteboard gesture", "Peace sign toggles Whiteboard"),
+                ("gesture_zoom", "Zoom gesture", "L-shaped hand gesture zooms"),
+            ):
+                self._switch_row(
+                    gestures,
+                    key,
+                    title,
+                    bool(self.state.get(key, False)),
+                    lambda active, key=key: self._set_gesture(key, active),
+                    subtitle,
+                )
+            content.append(gestures)
+            return page
         self._switch_row(
             gestures,
             "gesture_zoom",
@@ -2253,6 +2289,13 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             return result
 
         self._debounce(key, operation)
+
+    def _set_gesture(self, key: str, enabled: bool) -> None:
+        self._submit(
+            f"{key.replace('_', ' ').title()} {'enabled' if enabled else 'disabled'}",
+            lambda: self.camera.set_gesture(key, enabled),
+            on_success=lambda result: self.state.__setitem__(key, result),
+        )
 
     def _set_feature(self, key: str, bit: int, enabled: bool) -> None:
         self._submit(

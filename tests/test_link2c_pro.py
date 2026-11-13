@@ -35,7 +35,11 @@ class Link2CProProfileTests(unittest.TestCase):
     def test_profile_selected_by_product_id(self):
         self.assertIs(profile_for(0x4C05), LINK2C_PRO_PROFILE)
         self.assertIs(profile_for(0x4C04), LINK2_PROFILE)
-        self.assertEqual(set(LINK2C_PRO_PROFILE.video_modes), {"normal", "tracking"})
+        self.assertEqual(
+            set(LINK2C_PRO_PROFILE.video_modes), {"normal", "tracking", "whiteboard", "deskview"}
+        )
+        self.assertEqual(LINK2C_PRO_PROFILE.video_modes["whiteboard"][:2], (0x04, 0x00))
+        self.assertEqual(LINK2C_PRO_PROFILE.video_modes["deskview"][:2], (0x06, 0x00))
         self.assertEqual(LINK2C_PRO_PROFILE.video_modes["tracking"][0], 0x07)
 
     def test_queryctrl_layout(self):
@@ -82,6 +86,33 @@ class Link2CProProfileTests(unittest.TestCase):
         self.assertEqual(payload[38:42], b"\xff\xff\xff\xff")
         self.assertEqual(payload[42:44], b"\x1a\x0e")
         self.assertEqual(payload[46:48], b"\x1a\x0e")
+
+    def test_gestures_drive_master_bit_and_mask(self):
+        camera, _writes, state = _fake_2c_pro(feature_mask=0x01C5)
+        self.assertTrue(camera.set_gesture("gesture_zoom", True))
+        self.assertEqual(int.from_bytes(state[(9, 0x1B)], "little") & 0x10, 0x10)
+        self.assertEqual(state[(9, 0x05)], b"\x04")
+        camera.set_gesture("gesture_whiteboard", True)
+        self.assertEqual(state[(9, 0x05)], b"\x0c")
+        camera.set_gesture("gesture_zoom", False)
+        self.assertEqual(state[(9, 0x05)], b"\x08")
+        self.assertEqual(int.from_bytes(state[(9, 0x1B)], "little") & 0x10, 0x10)
+        camera.set_gesture("gesture_whiteboard", False)
+        self.assertEqual(state[(9, 0x05)], b"\x00")
+        self.assertEqual(int.from_bytes(state[(9, 0x1B)], "little") & 0x10, 0)
+
+    def test_deskview_correction_matches_link_controller(self):
+        camera, _writes, state = _fake_2c_pro()
+        payload = bytearray(61)
+        payload[0] = 0x06
+        state[(9, 0x02)] = bytes(payload)
+        self.assertEqual(camera.set_deskview_correction(45), 45)
+        self.assertEqual(state[(9, 0x02)][52:54], bytes.fromhex("3efe"))
+        camera.set_deskview_correction(10)
+        self.assertEqual(state[(9, 0x02)][52:54], bytes.fromhex("e0fc"))
+        camera.set_deskview_correction(80)
+        self.assertEqual(state[(9, 0x02)][52:54], bytes.fromhex("9cff"))
+        self.assertEqual(state[(9, 0x02)][0], 0x06)
 
 
 if __name__ == "__main__":
