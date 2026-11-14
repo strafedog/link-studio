@@ -2,6 +2,15 @@
 
 All notable changes to Link Studio are recorded here.
 
+## Unreleased (strafedog fork)
+
+- `link-studio ctl`: scriptable control (presets, mode, framing, audio, zoom, move, HDR, mirror,
+  state), routed through a running window when there is one.
+- `link-studio daemon` + `link-studio-daemon.service`: applies the default preset when the camera is
+  connected, and switches presets when a call starts or ends (Presets → Calls).
+- Scene presets now restore the 2C Pro crop position through its digital PTZ write.
+- Live palette from `~/.config/link-studio/colors.toml` for non-Omarchy theming tools.
+
 ## 1.0.4 — 2026-09-02
 
 - Made user-scope icon installation independent of unrelated malformed icon-cache entries already

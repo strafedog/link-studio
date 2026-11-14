@@ -47,6 +47,8 @@ from .constants import (
     TRACKING_SPEED_MAX,
     ModelProfile,
 )
+from .control import CommandError, apply_hardware_values, camera_streaming, execute, find_preset
+from .ctlserver import ControlServer
 from .diagnostics import create_support_bundle
 from .effects import EffectSettings, Rect, TrackingTarget
 from .geometry import contained_rect, frame_region_from_drag
@@ -73,6 +75,7 @@ from .storage import StorageSettings
 from .teleprompter import ScriptStore, TeleprompterWindow
 from .theme import OmarchyThemeBridge, Palette
 from .view_widgets import CropMinimap, MicPatternIcon
+from .watch import AutomationSettings
 
 LOGGER = logging.getLogger("link_studio.window")
 
@@ -106,6 +109,15 @@ def control_dropdown_index(key: str, value: object) -> int | None:
 
 def _camera_profile(camera: object) -> ModelProfile:
     return getattr(camera, "profile", LINK2_PROFILE)
+
+
+def _streaming(window: object) -> bool:
+    """True when the preview or another client (a browser in a call) streams the camera."""
+
+    if window.preview.running:
+        return True
+    device = getattr(window.camera, "device", None)
+    return bool(device) and camera_streaming(device.path)
 
 
 def _camera_control_maximum(camera: object, key: str, default: int) -> int:
@@ -235,6 +247,13 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         self.preview.processor.set_tracking_callback(self._tracking_target_received)
         self.theme_bridge = OmarchyThemeBridge(self._theme_applied)
         self.theme_bridge.start()
+        self.control_server = ControlServer(
+            self._ctl_request, lambda run: GLib.idle_add(lambda: run() and False)
+        )
+        try:
+            self.control_server.start()
+        except OSError:
+            LOGGER.exception("Could not open the link-studio ctl socket")
         self.connect("close-request", self._on_close_request)
         if start_preview:
             GLib.idle_add(self._activate_preview)
@@ -655,8 +674,102 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         self.preset_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.preset_list.add_css_class("boxed-list")
         content.append(self.preset_list)
+
+        automation = self._group(
+            "Calls",
+            "Applied by the link-studio daemon service when another app (a browser call, OBS) "
+            "starts or stops using the camera. The default preset (star) is applied whenever "
+            "the camera is plugged in.",
+        )
+        self.automation = AutomationSettings.load()
+        self._automation_dropdowns: dict[str, Gtk.DropDown] = {}
+        for key, title in (("call_start", "When a call starts"), ("call_end", "When a call ends")):
+            row = self._action_row(title)
+            dropdown = Gtk.DropDown(valign=Gtk.Align.CENTER)
+            dropdown.connect("notify::selected", self._automation_changed, key)
+            row.add_suffix(dropdown)
+            automation.add(row)
+            self._automation_dropdowns[key] = dropdown
+        content.append(automation)
         self._refresh_preset_list()
         return page
+
+    def _follow_preset_rename(self, old: str, new: str) -> None:
+        changed = False
+        for key in ("call_start", "call_end"):
+            if getattr(self.automation, key) == old:
+                setattr(self.automation, key, new)
+                changed = True
+        if changed:
+            with suppress(OSError):
+                self.automation.save()
+
+    def _automation_choices(self) -> list[str]:
+        return ["Do nothing", *(preset.name for preset in self.presets.presets)]
+
+    def _refresh_automation_dropdowns(self) -> None:
+        dropdowns = getattr(self, "_automation_dropdowns", {})
+        choices = self._automation_choices()
+        previous = self._updating
+        self._updating = True
+        try:
+            for key, dropdown in dropdowns.items():
+                dropdown.set_model(Gtk.StringList.new(choices))
+                current = getattr(self.automation, key)
+                dropdown.set_selected(choices.index(current) if current in choices else 0)
+        finally:
+            self._updating = previous
+
+    def _automation_changed(self, dropdown: Gtk.DropDown, _param: object, key: str) -> None:
+        if self._updating:
+            return
+        index = dropdown.get_selected()
+        choices = self._automation_choices()
+        name = choices[index] if 0 < index < len(choices) else None
+        setattr(self.automation, key, name)
+        try:
+            self.automation.save()
+        except OSError as exc:
+            self._toast(f"Could not save call presets: {exc}")
+
+    # ------------------------------------------------------------ ctl socket
+
+    def _ctl_request(self, args: list[str], reply: Callable[[dict[str, Any]], None]) -> None:
+        if self._closed:
+            reply({"error": "window is closing"})
+            return
+        command = args[0] if args else ""
+        if command in {"preset", "restore"}:
+            if command == "restore":
+                index = self.presets.default_index
+                if index is None or not 0 <= index < len(self.presets.presets):
+                    reply({"restored": "nothing to restore (no default preset)"})
+                    return
+                preset = self.presets.presets[index]
+            else:
+                try:
+                    index, preset = find_preset(self.presets, args[1] if len(args) > 1 else "")
+                except CommandError as exc:
+                    reply({"error": str(exc)})
+                    return
+            self._apply_preset(index, startup=command == "restore")
+            reply({"applied": preset.name})
+            return
+
+        def operation() -> tuple[dict[str, Any], dict[str, Any]]:
+            result = execute(self.camera, args, self.presets, streaming=_streaming(self))
+            return result, self.camera.read_state()
+
+        def success(outcome: tuple[dict[str, Any], dict[str, Any]]) -> None:
+            result, refreshed = outcome
+            self.state.update(refreshed)
+            self._sync_control_widgets(refreshed)
+            self._sync_mode_buttons(str(refreshed.get("mode", "normal")))
+            reply(result)
+
+        self._submit(
+            "", operation, on_success=success, on_error=lambda exc: reply({"error": str(exc)})
+        )
 
     def _build_digital_view_group(self) -> Adw.PreferencesGroup:
         group = self._group("View", "Drag the box to reframe the digital crop; zoom with + and −.")
@@ -2871,6 +2984,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         self._toast(f"Deleted color template “{name}”")
 
     def _refresh_preset_list(self) -> None:
+        self._refresh_automation_dropdowns()
         child = self.preset_list.get_first_child()
         while child:
             following = child.get_next_sibling()
@@ -2987,11 +3101,13 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         def response(_dialog: Adw.AlertDialog, response_id: str) -> None:
             if response_id != "rename":
                 return
+            old_name = preset.name
             try:
                 self.presets.rename(index, entry.get_text())
             except ValueError as exc:
                 self._toast(str(exc))
                 return
+            self._follow_preset_rename(old_name, self.presets.presets[index].name)
             self._refresh_preset_list()
             self._toast("Preset renamed")
 
@@ -3069,54 +3185,6 @@ class LinkStudioWindow(Adw.ApplicationWindow):
 
         def operation() -> tuple[str, dict[str, Any]]:
             values = preset.values
-            for key in (
-                "brightness",
-                "contrast",
-                "saturation",
-                "hue",
-                "sharpness",
-                "anti_flicker",
-                "zoom",
-                "pan",
-                "tilt",
-            ):
-                if key in values:
-                    self.camera.set_control(key, int(values[key]))
-            if "focus_auto" in values:
-                self.camera.set_control("focus_auto", bool(values["focus_auto"]))
-            if not values.get("focus_auto", True) and "focus" in values:
-                self.camera.set_control("focus", int(values["focus"]))
-            if "white_balance_auto" in values:
-                self.camera.set_control("white_balance_auto", bool(values["white_balance_auto"]))
-            if not values.get("white_balance_auto", True) and "white_balance_temperature" in values:
-                self.camera.set_control(
-                    "white_balance_temperature", int(values["white_balance_temperature"])
-                )
-            if "auto_exposure" in values:
-                self.camera.set_auto_exposure(bool(values["auto_exposure"]))
-            if "exposure_compensation" in values:
-                self.camera.set_exposure_compensation(int(values["exposure_compensation"]))
-            if not values.get("auto_exposure", True):
-                if "iso" in values:
-                    self.camera.set_manual_iso(int(values["iso"]))
-                if "shutter_us" in values:
-                    self.camera.set_shutter(int(values["shutter_us"]))
-            for key, bit in (
-                ("hdr", FEATURE_HDR),
-                ("mirror", FEATURE_MIRROR),
-                ("gesture_zoom", FEATURE_GESTURE_ZOOM),
-            ):
-                if key in values:
-                    self.camera.set_feature(bit, bool(values[key]))
-            framings = _camera_profile(self.camera).framing_modes
-            if "framing" in values and values["framing"] in framings:
-                self.camera.set_framing(str(values["framing"]))
-            if "tracking_speed" in values:
-                self.camera.set_tracking_speed(int(values["tracking_speed"]))
-            if "audio_mode" in values:
-                self.camera.set_audio_mode(str(values["audio_mode"]))
-            elif "noise_cancellation" in values:
-                self.camera.set_noise_cancellation(bool(values["noise_cancellation"]))
             stored_effects = values.get("software_effects")
             if isinstance(stored_effects, dict):
                 restored = dict(stored_effects)
@@ -3127,10 +3195,9 @@ class LinkStudioWindow(Adw.ApplicationWindow):
                         tuple(region) for region in restored["pause_areas"]
                     )
                 self.preview.set_effects(**restored)
-            mode = str(values.get("mode", "normal"))
-            if mode in _camera_profile(self.camera).video_modes:
-                self.camera.set_video_mode(mode, verify_streaming=self.preview.running)
-            return mode, self.camera.read_state()
+            mode = apply_hardware_values(self.camera, values, _streaming(self))
+            refreshed = self.camera.read_state()
+            return mode or str(refreshed.get("mode", "normal")), refreshed
 
         def success(result: tuple[str, dict[str, Any]]) -> None:
             mode, refreshed = result
@@ -3205,6 +3272,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         self._closed = True
         self.camera.cancel_pending_operations()
         self.remote.stop()
+        self.control_server.stop()
         if self._ai_recording_timer:
             GLib.source_remove(self._ai_recording_timer)
             self._ai_recording_timer = 0

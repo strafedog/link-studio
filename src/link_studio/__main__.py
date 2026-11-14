@@ -33,8 +33,20 @@ def _diagnose(device_path: str | None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "ctl":
+        from .control import main as ctl_main
+
+        return ctl_main(argv[1:])
+    if argv and argv[0] == "daemon":
+        from .watch import main as daemon_main
+
+        return daemon_main()
+
     parser = argparse.ArgumentParser(
-        description="Native Linux controller for Insta360 Link webcams"
+        description="Native Linux controller for Insta360 Link webcams",
+        epilog="Also: `link-studio ctl --help` (scriptable control) and `link-studio daemon`"
+        " (re-apply settings on connect, switch presets around calls).",
     )
     parser.add_argument("--device", help="V4L2 capture node (auto-detected by default)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")

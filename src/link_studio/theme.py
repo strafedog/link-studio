@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import tomllib
@@ -72,7 +73,22 @@ def load_palette(colors_path: Path) -> Palette | None:
     )
 
 
+def user_colors_path() -> Path:
+    """Palette written by another theming tool (e.g. a Noctalia or matugen template).
+
+    Same keys as Omarchy's colors.toml. When present it wins over Omarchy.
+    """
+
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config_home / "link-studio/colors.toml"
+
+
 def load_current_omarchy_palette() -> Palette | None:
+    user = user_colors_path()
+    if user.is_file():
+        palette = load_palette(user)
+        if palette:
+            return palette
     current = omarchy_current_dir()
     return load_palette(current / "theme/colors.toml")
 
@@ -162,7 +178,10 @@ class OmarchyThemeBridge:
             )
 
         current = omarchy_current_dir()
-        for directory in (current, current / "theme"):
+        user_dir = user_colors_path().parent
+        with contextlib.suppress(OSError):
+            user_dir.mkdir(parents=True, exist_ok=True)
+        for directory in (current, current / "theme", user_dir):
             try:
                 monitor = Gio.File.new_for_path(str(directory)).monitor_directory(
                     Gio.FileMonitorFlags.NONE, None

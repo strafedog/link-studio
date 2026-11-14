@@ -1,0 +1,13 @@
+[Unit]
+Description=Link Studio camera automation (restore settings on connect, call presets)
+Documentation=https://github.com/strafedog/link-studio
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+ExecStart=/usr/bin/link-studio daemon
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

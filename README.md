@@ -93,10 +93,46 @@ The helpers use `pacman` for the required Arch packages. The virtual-camera help
 `/dev/video20` device. The AI helper installs `whisper-cpp` and verifies the downloaded multilingual
 base model against a pinned SHA-256 checksum.
 
+## Scripting and automation
+
+`link-studio ctl` changes the camera from a shell, a compositor binding or a script. With the window
+open it goes through the window (over `$XDG_RUNTIME_DIR/link-studio/ctl.sock`) so the controls stay
+in step; otherwise it talks to the camera directly.
+
+```bash
+link-studio ctl presets                 # list scene presets, * = default
+link-studio ctl preset "Pete CloudHound"   # by name or number
+link-studio ctl mode tracking           # normal, tracking, whiteboard, deskview, ...
+link-studio ctl framing head
+link-studio ctl zoom +20                # or an absolute 100-400
+link-studio ctl move left 10
+link-studio ctl hdr toggle
+link-studio ctl state                   # JSON
+```
+
+`link-studio daemon`, run as the `link-studio-daemon` systemd user service, does two things:
+
+- **Restore on connect.** When the camera appears (plug in, dock, login) it applies the default
+  scene preset, the starred one. A 2C Pro without a default preset gets its remembered crop back.
+  AI modes need a live stream, so the mode itself is left to the call preset.
+- **Call presets.** When another program (a browser call, OBS) holds the camera, or a
+  v4l2loopback virtual camera fed by Link Studio, for 3 seconds, it applies the preset chosen
+  under Presets → Calls → When a call starts. Eight seconds after the camera is released it
+  applies "When a call ends". The choices live in `~/.config/link-studio/automation.json`.
+
+```bash
+systemctl --user enable --now link-studio-daemon
+journalctl --user -u link-studio-daemon -f
+```
+
 ## Desktop appearance
 
 Link Studio follows the normal libadwaita light/dark appearance. On Omarchy it also respects the
 active color palette automatically; no theme hook or user configuration is required.
+
+Other theming tools (Noctalia, matugen, pywal templates) can write an Omarchy-style
+`~/.config/link-studio/colors.toml` (`mode`, `accent`, `background`, `foreground`, ...). It takes
+priority over Omarchy and is reloaded live when it changes.
 
 Global actions use the desktop portal rather than editing Hyprland bindings. Enable them under
 Device → Application. Desktops with a portal configuration dialog can assign keys there. On
