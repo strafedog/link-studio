@@ -94,6 +94,7 @@ _DROPDOWN_VALUES: dict[str, tuple[object, ...]] = {
         "smart_whiteboard",
     ),
     "audio_mode": ("voice_focus", "voice_suppression", "music_balance"),
+    "matting": ("rvm", "mediapipe"),
 }
 
 
@@ -1272,6 +1273,15 @@ class LinkStudioWindow(Adw.ApplicationWindow):
             0,
             self._effect_mode_changed,
         )
+        self.matting_dropdown = self._combo_row(
+            advanced,
+            "matting",
+            "Edge quality",
+            ["Best (Robust Video Matting)", "Fast (MediaPipe)"],
+            0,
+            self._matting_changed,
+            "Best needs an Intel GPU and falls back to Fast without one",
+        )
         self._spin_row(
             advanced,
             "effect_intensity",
@@ -2057,6 +2067,18 @@ class LinkStudioWindow(Adw.ApplicationWindow):
         self._toast(
             f"{mode.replace('_', ' ').title()} {'enabled' if mode != 'none' else 'disabled'}"
         )
+
+    def _matting_changed(self, selected: int) -> None:
+        engine = _DROPDOWN_VALUES["matting"][min(selected, 1)]
+        self.preview.processor.reset_analysis()
+        self.preview.set_effects(matting=engine)
+        if engine == "rvm":
+            # The status is only known once frames have gone through the network.
+            GLib.timeout_add_seconds(6, self._report_matting_status)
+
+    def _report_matting_status(self) -> bool:
+        self._toast(self.preview.processor.matting_status())
+        return False
 
     def _background_color_changed(self, button: Gtk.ColorDialogButton) -> None:
         if not self._updating:
@@ -3210,6 +3232,7 @@ class LinkStudioWindow(Adw.ApplicationWindow):
                     {
                         "orientation": software.get("orientation", "identity"),
                         "effect_mode": software.get("mode", "none"),
+                        "matting": software.get("matting", "rvm"),
                         "effect_intensity": software.get("intensity", 55),
                         "key_tolerance": software.get("key_tolerance", 70),
                     }

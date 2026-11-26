@@ -23,6 +23,15 @@ official `ggerganov/whisper.cpp` Hugging Face repository. The helper verifies SH
 the converted model collection as MIT-licensed. This model is not included in Link Studio's source
 or distribution archive.
 
+## Robust Video Matting
+
+The optional "Best" edge quality for background effects uses the MobileNetV3 model from
+[Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting) by Shanchuan Lin et al.,
+licensed under the GNU General Public License v3.0. The weights are not included in this
+repository; packaging downloads the official v1.0.0 ONNX release (sha256-checked) and converts it
+to OpenVINO IR with `python -m link_studio.matting convert`. Inference uses
+[OpenVINO](https://github.com/openvinotoolkit/openvino) (Apache-2.0).
+
 ## Interoperability research
 
 Link Studio's direct-control implementation was informed by public reverse-engineering research in

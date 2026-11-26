@@ -34,6 +34,8 @@ Issues = "https://github.com/jweaver60/link-studio/issues"
 
 [project.optional-dependencies]
 dev = ["build>=1.3", "installer>=0.7", "ruff>=0.12"]
+# Robust Video Matting on Intel GPUs (see link_studio/matting.py).
+gpu = ["openvino>=2025.0"]
 
 [project.scripts]
 link-studio = "link_studio.__main__:main"
@@ -45,7 +47,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-link_studio = ["models/*.task", "models/*.tflite"]
+link_studio = ["models/*.task", "models/*.tflite", "models/*.xml", "models/*.bin"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

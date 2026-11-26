@@ -28,6 +28,10 @@ class EffectSettings:
     key_tolerance: int = 70
     orientation: str = "identity"
     tracking_mode: str = "off"
+    # "rvm": Robust Video Matting on the GPU (sharp hair/beard edges), falling back to
+    # MediaPipe while it compiles or when no GPU/model is available. "mediapipe": always
+    # the fast 256x256 selfie segmenter.
+    matting: str = "rvm"
     tracking_area: Rect = (0.0, 0.0, 1.0, 1.0)
     pause_areas: tuple[Rect, ...] = ()
 
@@ -70,6 +74,7 @@ class EffectProcessor:
         {"identity", "vertical_flip", "rotate_right", "rotate_left", "rotate_180"}
     )
     TRACKING_MODES = frozenset({"off", "single", "group"})
+    MATTING_ENGINES = frozenset({"rvm", "mediapipe"})
 
     def __init__(self) -> None:
         self._settings = EffectSettings()
@@ -88,6 +93,8 @@ class EffectProcessor:
         self._analysis_generation = 0
         self._background_cache: tuple[str, int, int, Any] | None = None
         self._whiteboard_quad: Any = None
+        self._matter: Any = None
+        self._matting_engine_used = "mediapipe"
 
     @property
     def settings(self) -> EffectSettings:
@@ -110,6 +117,8 @@ class EffectProcessor:
                 raise ValueError(f"unsupported effect mode: {candidate.mode}")
             if candidate.orientation not in self.ORIENTATIONS:
                 raise ValueError(f"unsupported orientation: {candidate.orientation}")
+            if candidate.matting not in self.MATTING_ENGINES:
+                raise ValueError(f"unsupported matting engine: {candidate.matting}")
             if candidate.tracking_mode not in self.TRACKING_MODES:
                 raise ValueError(f"unsupported tracking mode: {candidate.tracking_mode}")
             if not 0 <= candidate.intensity <= 100:
@@ -135,6 +144,8 @@ class EffectProcessor:
             self._last_landmark_frame = -100
             self._whiteboard_quad = None
             self._analysis_generation += 1
+            if self._matter is not None:
+                self._matter.reset()
 
     @staticmethod
     def _model_path(name: str) -> str:
@@ -151,6 +162,9 @@ class EffectProcessor:
             raise EffectsError(
                 "Advanced effects require the mediapipe, opencv, and numpy packages"
             ) from exc
+        # OpenCV defaults to one worker per CPU thread; at 1080p30 that mostly spins. Four
+        # workers measured the same frame time at about half the CPU.
+        cv2.setNumThreads(4)
         self._runtime = (cv2, mp, np)
         return self._runtime
 
@@ -191,8 +205,37 @@ class EffectProcessor:
         self._timestamp_ms = max(self._timestamp_ms + 1, now)
         return self._timestamp_ms
 
+    @property
+    def matting_engine(self) -> str:
+        """The engine that produced the latest mask: "rvm" or "mediapipe"."""
+
+        return self._matting_engine_used
+
+    def matting_status(self) -> str:
+        if self._matter is None:
+            return "Robust Video Matting starts with the first frame"
+        reason = self._matter.unavailable_reason
+        if reason:
+            return f"Using MediaPipe: {reason}"
+        if self._matting_engine_used == "rvm":
+            return f"Robust Video Matting on {self._matter.device}"
+        return "Preparing Robust Video Matting (MediaPipe meanwhile)"
+
+    def _rvm_alpha(self, image: Any) -> Any | None:
+        if self._matter is None:
+            from .matting import RvmMatter
+
+            self._matter = RvmMatter()
+        return self._matter.alpha(image)
+
     def _segment(self, image: Any) -> Any:
         cv2, mp, np = self._load_runtime()
+        if self.settings.matting == "rvm":
+            alpha = self._rvm_alpha(image)
+            if alpha is not None:
+                self._matting_engine_used = "rvm"
+                return alpha[..., None]
+        self._matting_engine_used = "mediapipe"
         with self._lock:
             mask = self._last_mask
             last_frame = self._last_segmentation_frame
@@ -289,7 +332,22 @@ class EffectProcessor:
 
     @staticmethod
     def _composite(foreground: Any, background: Any, mask: Any) -> Any:
-        return (foreground * mask + background * (1.0 - mask)).clip(0, 255).astype("uint8")
+        # cv2.blendLinear takes about 1.5 ms at 1080p; the numpy expression it replaced took
+        # about 30 ms, which alone blew the 33 ms frame budget.
+        import cv2
+        import numpy as np
+
+        weights = np.ascontiguousarray(mask.reshape(mask.shape[:2]), dtype=np.float32)
+        if foreground.dtype != np.uint8:
+            foreground = foreground.clip(0, 255).astype(np.uint8)
+        if background.dtype != np.uint8:
+            background = background.clip(0, 255).astype(np.uint8)
+        return cv2.blendLinear(
+            np.ascontiguousarray(foreground),
+            np.ascontiguousarray(background),
+            weights,
+            cv2.subtract(1.0, weights),
+        )
 
     def _apply_background_effect(self, image: Any, settings: EffectSettings) -> Any:
         cv2, _mp, _np = self._load_runtime()
@@ -536,6 +594,9 @@ class EffectProcessor:
         return output_width, output_height, output_stride, image.tobytes(), pts
 
     def close(self) -> None:
+        if self._matter is not None:
+            self._matter.close()
+            self._matter = None
         for runtime in (self._segmenter, self._landmarker):
             if runtime is not None:
                 with suppress(Exception):

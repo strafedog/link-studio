@@ -6,3 +6,5 @@ __pycache__/
 build/
 dist/
 .venv/
+# RVM weights are GPL-3.0 and downloaded at build time (python -m link_studio.matting)
+src/link_studio/models/rvm_*
