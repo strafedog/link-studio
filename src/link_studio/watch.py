@@ -3,6 +3,9 @@
 Runs as a systemd user service. It watches /dev for the camera appearing (hotplug, dock,
 boot) and the camera's capture node, plus any v4l2loopback node, for other programs opening
 them. A non-Link-Studio process holding one of those nodes counts as a call.
+
+It also runs the headless virtual camera (vcam.py) on the first v4l2loopback node, so
+calls get Link Studio's effects without the window open.
 """
 
 from __future__ import annotations
@@ -50,6 +53,8 @@ class AutomationSettings:
 
     call_start: str | None = None
     call_end: str | None = None
+    # Headless virtual camera in the daemon (see vcam.py).
+    virtual_camera: bool = True
 
     @classmethod
     def load(cls, path: Path | None = None) -> AutomationSettings:
@@ -64,14 +69,26 @@ class AutomationSettings:
             value = raw.get(key)
             return value.strip() if isinstance(value, str) and value.strip() else None
 
-        return cls(call_start=name("call_start"), call_end=name("call_end"))
+        return cls(
+            call_start=name("call_start"),
+            call_end=name("call_end"),
+            virtual_camera=raw.get("virtual_camera", True) is not False,
+        )
 
     def save(self, path: Path | None = None) -> None:
         path = path or default_automation_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
         temporary.write_text(
-            json.dumps({"call_start": self.call_start, "call_end": self.call_end}, indent=2) + "\n",
+            json.dumps(
+                {
+                    "call_start": self.call_start,
+                    "call_end": self.call_end,
+                    "virtual_camera": self.virtual_camera,
+                },
+                indent=2,
+            )
+            + "\n",
             encoding="utf-8",
         )
         temporary.replace(path)
@@ -166,6 +183,10 @@ class Daemon:
         self._pending_since: float | None = None
         self._evaluate_at: float | None = None
         self._rescan_at: float | None = time.monotonic()  # first scan restores at startup
+        self.vcam = None
+        self.loopback: str | None = None
+        self._camera_for_vcam: str | None = None
+        self._vcam_check_at: float | None = None
 
     # ----------------------------------------------------------- devices
 
@@ -173,12 +194,15 @@ class Daemon:
         from .camera import discover_cameras
         from .preview import discover_virtual_camera_devices
 
-        current = {device.path for device in discover_cameras()}
+        devices = discover_cameras()
+        current = {device.path for device in devices}
         for path in sorted(current - self.cameras):
             LOGGER.info("camera at %s", path)
             self._restore(path)
         self.cameras = current
-        wanted = current | set(discover_virtual_camera_devices())
+        loopbacks = discover_virtual_camera_devices()
+        self._update_vcam(loopbacks[0] if loopbacks else None, sorted(current))
+        wanted = current | set(loopbacks)
         for path in set(self.node_watches) - wanted:
             with suppress(OSError):
                 self.inotify.remove(self.node_watches.pop(path))
@@ -190,6 +214,29 @@ class Daemon:
             except OSError as exc:
                 LOGGER.warning("cannot watch %s: %s", path, exc)
         self._evaluate_at = time.monotonic()
+
+    def _update_vcam(self, loopback: str | None, cameras: list[str]) -> None:
+        if not AutomationSettings.load().virtual_camera:
+            loopback = None
+        if self.vcam is not None and self.vcam.loopback != loopback:
+            self.vcam.close()
+            self.vcam = None
+        self.loopback = loopback
+        self._camera_for_vcam = cameras[0] if cameras else None
+        if loopback and self.vcam is None:
+            from .vcam import VirtualCameraService
+
+            try:
+                self.vcam = VirtualCameraService(loopback)
+                self.vcam.start()
+            except Exception as exc:  # GStreamer missing etc.: calls still work
+                LOGGER.warning("headless virtual camera unavailable: %s", exc)
+                self.vcam = None
+
+    def _check_vcam(self) -> None:
+        if self.vcam is None or self.loopback is None:
+            return
+        self.vcam.update(bool(node_holders(self.loopback)), self._camera_for_vcam)
 
     def _restore(self, path: str) -> None:
         from .control import run_direct
@@ -238,7 +285,11 @@ class Daemon:
         LOGGER.info("watching for the camera and calls")
         while True:
             now = time.monotonic()
-            deadlines = [d for d in (self._evaluate_at, self._rescan_at) if d is not None]
+            deadlines = [
+                d
+                for d in (self._evaluate_at, self._rescan_at, self._vcam_check_at)
+                if d is not None
+            ]
             timeout = max(0.0, min(deadlines) - now) if deadlines else FALLBACK_POLL
             readable, _, _ = select.select([self.inotify.fd], [], [], min(timeout, FALLBACK_POLL))
             now = time.monotonic()
@@ -248,8 +299,14 @@ class Daemon:
                         if name.startswith("video") and mask & (IN_CREATE | IN_DELETE | IN_ATTRIB):
                             self._rescan_at = now + HOTPLUG_SETTLE
                     elif mask & (IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE):
+                        if path == self.loopback and mask & IN_OPEN:
+                            # Start the camera as soon as a call app opens the virtual camera.
+                            self._vcam_check_at = now + 0.3
                         # Let the opener finish (and our own reads settle) before scanning /proc.
                         self._evaluate_at = min(self._evaluate_at or now + 0.5, now + 0.5)
+            if self._vcam_check_at is not None and now >= self._vcam_check_at:
+                self._vcam_check_at = None
+                self._check_vcam()
             if self._rescan_at is not None and now >= self._rescan_at:
                 self._rescan_at = None
                 self._rescan()

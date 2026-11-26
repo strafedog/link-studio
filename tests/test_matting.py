@@ -42,3 +42,21 @@ class FallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutomationVirtualCameraTests(unittest.TestCase):
+    def test_virtual_camera_flag_round_trips_and_defaults_on(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from link_studio.watch import AutomationSettings
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "automation.json"
+            path.write_text(json.dumps({"call_start": "A"}))
+            self.assertTrue(AutomationSettings.load(path).virtual_camera)
+            AutomationSettings(call_start="A", virtual_camera=False).save(path)
+            loaded = AutomationSettings.load(path)
+            self.assertFalse(loaded.virtual_camera)
+            self.assertEqual(loaded.call_start, "A")

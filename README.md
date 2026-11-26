@@ -110,7 +110,7 @@ link-studio ctl hdr toggle
 link-studio ctl state                   # JSON
 ```
 
-`link-studio daemon`, run as the `link-studio-daemon` systemd user service, does two things:
+`link-studio daemon`, run as the `link-studio-daemon` systemd user service, does three things:
 
 - **Restore on connect.** When the camera appears (plug in, dock, login) it applies the default
   scene preset, the starred one. A 2C Pro without a default preset gets its remembered crop back.
@@ -119,6 +119,13 @@ link-studio ctl state                   # JSON
   v4l2loopback virtual camera fed by Link Studio, for 3 seconds, it applies the preset chosen
   under Presets → Calls → When a call starts. Eight seconds after the camera is released it
   applies "When a call ends". The choices live in `~/.config/link-studio/automation.json`.
+- **Headless virtual camera.** With a v4l2loopback device loaded (`exclusive_caps=1`), the daemon
+  keeps it listed as a camera by sending a placeholder (the effect's background image) at 2 fps.
+  When a call app opens it, the physical camera starts at 720p30 with the software effects of the
+  call preset (else the default preset), e.g. background replacement with Robust Video Matting,
+  and stops six seconds after the app lets go. It stays off the device while a Link Studio window
+  is open, so the window's own Virtual camera switch still works. Turn it off with
+  `"virtual_camera": false` in `automation.json`.
 
 ```bash
 systemctl --user enable --now link-studio-daemon
