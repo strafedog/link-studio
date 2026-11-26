@@ -32,6 +32,23 @@ def _diagnose(device_path: str | None) -> int:
     return 0 if devices else 2
 
 
+
+# /proc/<pid>/comm for the daemon. Privacy indicators (e.g. Noctalia) name camera
+# users by comm, and the daemon always holds the virtual camera for its
+# placeholder, so "python" would show as a camera user around the clock and
+# can't be filtered without hiding every Python app. Max 15 characters.
+DAEMON_PROCESS_NAME = "link-studio-dmn"
+
+
+def _set_process_name(name: str) -> None:
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(15, name.encode()[:15] + b"\0", 0, 0, 0)  # PR_SET_NAME
+    except (OSError, AttributeError):
+        pass
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "ctl":
@@ -40,6 +57,8 @@ def main(argv: list[str] | None = None) -> int:
         return ctl_main(argv[1:])
     if argv and argv[0] == "daemon":
         from .watch import main as daemon_main
+
+        _set_process_name(DAEMON_PROCESS_NAME)
 
         return daemon_main()
 
